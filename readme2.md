@@ -51,3 +51,46 @@ Please generate the exact code for:
 5. `KubernetesJobLauncher.java` (Fabric8 implementation with SHA-256 naming).
 6. `FileProcessingBatchConfig.java` (Spring Batch 5 configuration).
 7. The Kubernetes YAML manifests for the `ReadWriteMany` PVC and the RBAC `ServiceAccount`/`Role` needed by Fabric8 to spawn jobs.
+
+
+
+## Prompt2
+
+Act as a Senior Cloud-Native Java Architect. I am providing an existing Spring Batch codebase at the bottom of this prompt. 
+
+Your task is to thoroughly analyze this existing code, extract my core business logic (ItemReaders, ItemProcessors, ItemWriters, and Entities), and completely replace the surrounding architecture with a decoupled, OpenShift-native multi-module pattern.
+
+**Target Tech Stack:**
+* Java 21 | Spring Boot 3.5.14 | Spring Batch 5.x (No JobBuilderFactory) | Fabric8 Kubernetes Client 6.10.0 | AWS SDK v2
+
+**Architectural Mandates (You must implement these strictly):**
+1. **Kill In-JVM Scheduling:** Remove all `@Scheduled` annotations. Scheduling is now handled externally by OpenShift `CronJobs`.
+2. **Module Split:** Refactor the logic into two distinct Spring Boot applications:
+   * `s3-import-job`: The orchestrator (OpenShift CronJob).
+   * `file-processing-job`: The batch processor (Dynamic K8s Job).
+3. **Profiles:** Implement `local` (H2 DB, local mock file system) and `openshift` (PostgreSQL, real PVC).
+
+**Module 1: `s3-import-job` Implementation Rules:**
+Rewrite my file-fetching logic into a run-to-completion app that does exactly this sequence:
+1. **Reaper:** Fail any DB records stuck in `PROCESSING` for >2 hours.
+2. **PVC GC:** Delete physical files in `/mnt/moss-data` that lack an active `PROCESSING` DB record.
+3. **Pessimistic Lock:** Use `@Lock(LockModeType.PESSIMISTIC_WRITE)` on the DB query to ensure no other file is `PROCESSING` cluster-wide. Exit gracefully if true.
+4. **Acquire & Download:** Fetch the oldest file from S3 (`input/`), download it to the PVC, and save a `PROCESSING` DB record with a UUID `fileId` and `correlationId`.
+5. **Dynamic K8s Trigger:** Use the Fabric8 client to launch the `file-processing-job` Pod. 
+   * *CRITICAL:* Generate the K8s Job name using a SHA-256 hash of the `fileId` truncated to 12 characters to strictly comply with Kubernetes RFC 1123 DNS limits. 
+   * Pass `FILE_ID`, `FILE_NAME`, and `LOCAL_FILE_PATH` as container environment variables.
+
+**Module 2: `file-processing-job` Implementation Rules:**
+Adapt my existing Spring Batch logic to this new isolated workflow:
+1. Use a `FlatFileItemReader` (or my existing reader logic) to read the file directly from the local PVC file system (`LOCAL_FILE_PATH`).
+2. Configure a persistent `JobRepository` for K8s pod-level retries.
+3. Implement a `JobExecutionListener`: On success/fail, update the DB status, move the S3 file to `success/` or `failed/`, and physically delete the file from the PVC.
+
+**Output Requirements:**
+Do not give me generic advice. Output the complete, refactored Java files (Entities, Repositories, Orchestrator, Fabric8 Launcher, Spring Batch Config) and the `application.yml` files. Ensure my original data processing logic is preserved but wrapped in this new architecture.
+
+---
+**MY EXISTING CODEBASE FOR ANALYSIS AND REPLACEMENT:**
+
+[PASTE ALL YOUR EXISTING JAVA FILES, CONFIGS, AND YAMLS HERE]
+
