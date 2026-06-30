@@ -1,0 +1,10 @@
+This is a sample text file for the OpenShift Batch Platform project.
+
+You can use this file as a template for adding content to your repository.
+
+Sample content:
+- Line 1
+- Line 2
+- Line 3
+
+Feel free to modify this file as needed.
