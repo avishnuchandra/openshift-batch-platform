@@ -1,10 +1,475 @@
 This is a sample text file for the OpenShift Batch Platform project.
 
-You can use this file as a template for adding content to your repository.
+#!/bin/bash
 
-Sample content:
-- Line 1
-- Line 2
-- Line 3
+PROJECT_DIR="openshift-batch-platform-runnable"
+echo "Initializing complete, runnable multi-module Spring Boot 3.5.14 project..."
 
-Feel free to modify this file as needed.
+mkdir -p $PROJECT_DIR
+cd $PROJECT_DIR
+
+# ---------------------------------------------------------
+# 1. DIRECTORY STRUCTURE
+# ---------------------------------------------------------
+mkdir -p common-core/src/main/java/com/enterprise/batch/common/{entity,repository,s3}
+mkdir -p s3-import-job/src/main/java/com/enterprise/batch/s3import/{service,config}
+mkdir -p s3-import-job/src/main/resources
+mkdir -p file-processing-job/src/main/java/com/enterprise/batch/fileprocessing/config
+mkdir -p file-processing-job/src/main/java/com/enterprise/batch/fileprocessing
+mkdir -p file-processing-job/src/main/resources
+
+# ---------------------------------------------------------
+# 2. GRADLE CONFIGURATION
+# ---------------------------------------------------------
+cat << 'EOF' > settings.gradle
+rootProject.name = 'openshift-batch-platform'
+include 'common-core', 's3-import-job', 'file-processing-job'
+EOF
+
+cat << 'EOF' > build.gradle
+plugins {
+    id 'java'
+    id 'org.springframework.boot' version '3.5.14' apply false
+    id 'io.spring.dependency-management' version '1.1.4' apply false
+}
+ext {
+    springFrameworkVersion = '6.2.14'
+    springSecurityVersion = '6.5.10'
+    fabric8Version = '6.10.0'
+}
+allprojects {
+    group = 'com.enterprise.batch'
+    version = '1.0.0-SNAPSHOT'
+    apply plugin: 'java'
+    apply plugin: 'io.spring.dependency-management'
+    java { sourceCompatibility = JavaVersion.VERSION_21; targetCompatibility = JavaVersion.VERSION_21 }
+    repositories { mavenCentral() }
+    dependencyManagement {
+        imports { mavenBom "org.springframework.boot:spring-boot-dependencies:3.5.14" }
+        dependencies {
+            dependency "org.springframework:spring-core:${springFrameworkVersion}"
+            dependency "io.fabric8:kubernetes-client:${fabric8Version}"
+        }
+    }
+}
+EOF
+
+cat << 'EOF' > common-core/build.gradle
+dependencies {
+    implementation 'org.springframework.boot:spring-boot-starter-data-jpa'
+    compileOnly 'org.projectlombok:lombok'
+    annotationProcessor 'org.projectlombok:lombok'
+}
+EOF
+
+cat << 'EOF' > s3-import-job/build.gradle
+dependencies {
+    implementation project(':common-core')
+    implementation 'org.springframework.boot:spring-boot-starter'
+    implementation 'io.fabric8:kubernetes-client'
+    runtimeOnly 'com.h2database:h2'
+    runtimeOnly 'org.postgresql:postgresql'
+    compileOnly 'org.projectlombok:lombok'
+    annotationProcessor 'org.projectlombok:lombok'
+}
+EOF
+
+cat << 'EOF' > file-processing-job/build.gradle
+dependencies {
+    implementation project(':common-core')
+    implementation 'org.springframework.boot:spring-boot-starter-batch'
+    runtimeOnly 'com.h2database:h2'
+    runtimeOnly 'org.postgresql:postgresql'
+    compileOnly 'org.projectlombok:lombok'
+    annotationProcessor 'org.projectlombok:lombok'
+}
+EOF
+
+# ---------------------------------------------------------
+# 3. COMMON CORE JAVA CLASSES 
+# ---------------------------------------------------------
+cat << 'EOF' > common-core/src/main/java/com/enterprise/batch/common/entity/FileMetadata.java
+package com.enterprise.batch.common.entity;
+import jakarta.persistence.*;
+import lombok.Data;
+import java.time.LocalDateTime;
+
+@Data 
+@Entity 
+@Table(name = "file_metadata")
+public class FileMetadata {
+    @Id private String fileId;
+    @Column(unique = true) private String fileName;
+    private String status;
+    private String correlationId;
+    private LocalDateTime updatedAt;
+
+    @PrePersist
+    @PreUpdate
+    public void preUpdate() { this.updatedAt = LocalDateTime.now(); }
+}
+EOF
+
+cat << 'EOF' > common-core/src/main/java/com/enterprise/batch/common/repository/FileMetadataRepository.java
+package com.enterprise.batch.common.repository;
+import com.enterprise.batch.common.entity.FileMetadata;
+import jakarta.persistence.LockModeType;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Lock;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
+import java.time.LocalDateTime;
+import java.util.List;
+
+public interface FileMetadataRepository extends JpaRepository<FileMetadata, String> {
+    
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
+    @Query("SELECT COUNT(f) > 0 FROM FileMetadata f WHERE f.status = 'PROCESSING'")
+    boolean existsByStatusLocked();
+
+    boolean existsByFileName(String fileName);
+
+    @Query("SELECT f.fileName FROM FileMetadata f WHERE f.status = 'PROCESSING'")
+    List<String> findProcessingFileNames();
+
+    @Query("SELECT f FROM FileMetadata f WHERE f.status = 'PROCESSING' AND f.updatedAt < :threshold")
+    List<FileMetadata> findStaleProcessingRecords(@Param("threshold") LocalDateTime threshold);
+}
+EOF
+
+# ---------------------------------------------------------
+# 4. S3 IMPORT ORCHESTRATOR 
+# ---------------------------------------------------------
+cat << 'EOF' > s3-import-job/src/main/java/com/enterprise/batch/s3import/S3ImportApplication.java
+package com.enterprise.batch.s3import;
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.boot.autoconfigure.domain.EntityScan;
+import org.springframework.data.jpa.repository.config.EnableJpaRepositories;
+
+@SpringBootApplication(scanBasePackages = "com.enterprise.batch")
+@EntityScan("com.enterprise.batch.common.entity")
+@EnableJpaRepositories("com.enterprise.batch.common.repository")
+public class S3ImportApplication {
+    public static void main(String[] args) { 
+        System.exit(SpringApplication.exit(SpringApplication.run(S3ImportApplication.class, args))); 
+    }
+}
+EOF
+
+cat << 'EOF' > s3-import-job/src/main/java/com/enterprise/batch/s3import/service/S3ImportOrchestrator.java
+package com.enterprise.batch.s3import.service;
+
+import com.enterprise.batch.common.entity.FileMetadata;
+import com.enterprise.batch.common.repository.FileMetadataRepository;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.boot.CommandLineRunner;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.time.LocalDateTime;
+import java.util.List;
+import java.util.UUID;
+import java.util.stream.Stream;
+
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class S3ImportOrchestrator implements CommandLineRunner {
+
+    private final FileMetadataRepository metadataRepository;
+    private final KubernetesJobLauncher k8sLauncher;
+
+    @Value("${PVC_MOUNT_PATH:./local-temp-storage}")
+    private String pvcMountPath;
+
+    @Override
+    @Transactional
+    public void run(String... args) {
+        log.info("--- Starting Fortified S3 Import Orchestration ---");
+        reapStaleRecords();
+        garbageCollectPvc();
+
+        if (metadataRepository.existsByStatusLocked()) {
+            log.info("Another file is currently PROCESSING. Exiting gracefully.");
+            return;
+        }
+
+        String fileName = "data-file-" + System.currentTimeMillis() + ".csv";
+        String fileId = UUID.randomUUID().toString();
+        String correlationId = UUID.randomUUID().toString();
+        Path localFilePath = Paths.get(pvcMountPath, fileName);
+
+        log.info("Simulating S3 download to PVC path: {}", localFilePath.toAbsolutePath());
+        try {
+            Files.createDirectories(Paths.get(pvcMountPath));
+            Files.writeString(localFilePath, "Header1,Header2\nValue1,Value2\nValue3,Value4");
+        } catch (IOException e) {
+            log.error("Failed to write to local PVC path", e);
+            return;
+        }
+
+        FileMetadata metadata = new FileMetadata();
+        metadata.setFileId(fileId);
+        metadata.setFileName(fileName);
+        metadata.setStatus("PROCESSING");
+        metadata.setCorrelationId(correlationId);
+        metadataRepository.save(metadata);
+
+        k8sLauncher.launchFileProcessingJob(fileId, fileName, correlationId, localFilePath.toAbsolutePath().toString());
+    }
+
+    private void reapStaleRecords() {
+        List<FileMetadata> staleRecords = metadataRepository.findStaleProcessingRecords(LocalDateTime.now().minusHours(2));
+        staleRecords.forEach(record -> {
+            log.warn("Reaper marking zombie record {} as FAILED.", record.getFileName());
+            record.setStatus("FAILED");
+            metadataRepository.save(record);
+        });
+    }
+
+    private void garbageCollectPvc() {
+        List<String> activeFiles = metadataRepository.findProcessingFileNames();
+        try (Stream<Path> paths = Files.walk(Paths.get(pvcMountPath), 1)) {
+            paths.filter(Files::isRegularFile).forEach(path -> {
+                if (!activeFiles.contains(path.getFileName().toString())) {
+                    try { Files.delete(path); log.info("PVC GC: Deleted orphaned file {}", path.getFileName()); } 
+                    catch (IOException ignored) {}
+                }
+            });
+        } catch (IOException ignored) {}
+    }
+}
+EOF
+
+cat << 'EOF' > s3-import-job/src/main/java/com/enterprise/batch/s3import/service/KubernetesJobLauncher.java
+package com.enterprise.batch.s3import.service;
+
+import io.fabric8.kubernetes.api.model.batch.v1.Job;
+import io.fabric8.kubernetes.api.model.batch.v1.JobBuilder;
+import io.fabric8.kubernetes.client.KubernetesClient;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Service;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class KubernetesJobLauncher {
+
+    private final KubernetesClient kubernetesClient;
+
+    @Value("${spring.profiles.active:local}")
+    private String activeProfile;
+
+    public void launchFileProcessingJob(String fileId, String fileName, String correlationId, String localFilePath) {
+        if ("local".equals(activeProfile)) {
+            log.info("LOCAL PROFILE ACTIVE: Skipping actual Kubernetes Job creation.");
+            log.info("To process this file locally, run the 'file-processing-job' with these environment variables:");
+            log.info("FILE_ID={} FILE_NAME={} LOCAL_FILE_PATH={}", fileId, fileName, localFilePath);
+            return;
+        }
+
+        String safeHash = generateSafeHash(fileId).substring(0, 12);
+        String jobName = "fp-" + safeHash;
+        
+        try {
+            Job job = new JobBuilder().withNewMetadata().withName(jobName).withNamespace("batch-platform").endMetadata()
+                .withNewSpec().withNewTemplate().withNewSpec()
+                .withRestartPolicy("Never").withServiceAccountName("batch-executor-sa")
+                .addNewContainer().withName("spring-batch-container").withImage("your-registry/file-processing:1.0")
+                .addNewEnv().withName("FILE_ID").withValue(fileId).endEnv()
+                .addNewEnv().withName("FILE_NAME").withValue(fileName).endEnv()
+                .addNewEnv().withName("LOCAL_FILE_PATH").withValue(localFilePath).endEnv()
+                .endContainer().endSpec().endTemplate().endSpec().build();
+
+            kubernetesClient.batch().v1().jobs().inNamespace("batch-platform").resource(job).create();
+            log.info("Submitted K8s Job: {}", jobName);
+        } catch (Exception e) {
+            log.warn("Fabric8 API Exception (Expected if no K8s context): {}", e.getMessage());
+        }
+    }
+
+    private String generateSafeHash(String input) {
+        try {
+            MessageDigest md = MessageDigest.getInstance("SHA-256");
+            byte[] hash = md.digest(input.getBytes(StandardCharsets.UTF_8));
+            StringBuilder hex = new StringBuilder(2 * hash.length);
+            for (byte b : hash) hex.append(String.format("%02x", b & 0xff));
+            return hex.toString();
+        } catch (Exception e) { return "fallback"; }
+    }
+}
+EOF
+
+# ---------------------------------------------------------
+# 5. FILE PROCESSING BATCH APP 
+# ---------------------------------------------------------
+cat << 'EOF' > file-processing-job/src/main/java/com/enterprise/batch/fileprocessing/FileProcessingApplication.java
+package com.enterprise.batch.fileprocessing;
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.boot.autoconfigure.domain.EntityScan;
+import org.springframework.data.jpa.repository.config.EnableJpaRepositories;
+
+@SpringBootApplication(scanBasePackages = "com.enterprise.batch")
+@EntityScan("com.enterprise.batch.common.entity")
+@EnableJpaRepositories("com.enterprise.batch.common.repository")
+public class FileProcessingApplication {
+    public static void main(String[] args) {
+        System.exit(SpringApplication.exit(SpringApplication.run(FileProcessingApplication.class, args)));
+    }
+}
+EOF
+
+cat << 'EOF' > file-processing-job/src/main/java/com/enterprise/batch/fileprocessing/config/FileProcessingBatchConfig.java
+package com.enterprise.batch.fileprocessing.config;
+
+import com.enterprise.batch.common.entity.FileMetadata;
+import com.enterprise.batch.common.repository.FileMetadataRepository;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.batch.core.Job;
+import org.springframework.batch.core.JobExecution;
+import org.springframework.batch.core.JobExecutionListener;
+import org.springframework.batch.core.Step;
+import org.springframework.batch.core.configuration.annotation.EnableBatchProcessing;
+import org.springframework.batch.core.job.builder.JobBuilder;
+import org.springframework.batch.core.repository.JobRepository;
+import org.springframework.batch.core.step.builder.StepBuilder;
+import org.springframework.batch.item.ItemProcessor;
+import org.springframework.batch.item.ItemWriter;
+import org.springframework.batch.item.file.FlatFileItemReader;
+import org.springframework.batch.item.file.builder.FlatFileItemReaderBuilder;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.core.io.FileSystemResource;
+import org.springframework.transaction.PlatformTransactionManager;
+
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+
+@Slf4j
+@Configuration
+@RequiredArgsConstructor
+public class FileProcessingBatchConfig {
+
+    private final JobRepository jobRepository;
+    private final PlatformTransactionManager transactionManager;
+    private final FileMetadataRepository metadataRepository;
+
+    @Value("${FILE_ID:test-local-id}")
+    private String fileId;
+
+    @Value("${FILE_NAME:test-local-file.csv}")
+    private String fileName;
+
+    @Value("${LOCAL_FILE_PATH:./local-temp-storage/test-local-file.csv}")
+    private String localFilePath;
+
+    @Bean
+    public Job dataProcessingJob(Step processFileStep) {
+        return new JobBuilder("dataProcessingJob", jobRepository)
+                .start(processFileStep)
+                .listener(new JobCompletionListener())
+                .build();
+    }
+
+    @Bean
+    public Step processFileStep(FlatFileItemReader<String> reader) {
+        return new StepBuilder("processFileStep", jobRepository)
+                .<String, String>chunk(10, transactionManager)
+                .reader(reader)
+                .processor((ItemProcessor<String, String>) item -> {
+                    log.info("Processing row: {}", item);
+                    return item.toUpperCase();
+                })
+                .writer((ItemWriter<String>) chunk -> log.info("Wrote chunk of size: {}", chunk.size()))
+                .build();
+    }
+
+    @Bean
+    public FlatFileItemReader<String> pvcFileReader() {
+        log.info("Reading from path: {}", localFilePath);
+        return new FlatFileItemReaderBuilder<String>()
+                .name("pvcFileReader")
+                .resource(new FileSystemResource(localFilePath))
+                .lineMapper((line, lineNumber) -> line)
+                .build();
+    }
+
+    private class JobCompletionListener implements JobExecutionListener {
+        @Override
+        public void afterJob(JobExecution jobExecution) {
+            log.info("Batch Job Finished with status: {}", jobExecution.getStatus());
+            
+            metadataRepository.findById(fileId).ifPresent(metadata -> {
+                metadata.setStatus(jobExecution.getStatus().name());
+                metadataRepository.save(metadata);
+            });
+
+            try {
+                Path path = Paths.get(localFilePath);
+                Files.deleteIfExists(path);
+                log.info("Cleaned up local PVC file: {}", localFilePath);
+            } catch (IOException e) {
+                log.error("Failed to delete local file", e);
+            }
+        }
+    }
+}
+EOF
+
+# ---------------------------------------------------------
+# 6. APPLICATION.YML FILES
+# ---------------------------------------------------------
+cat << 'EOF' > s3-import-job/src/main/resources/application.yml
+spring:
+  application.name: s3-import-job
+  profiles.active: ${SPRING_PROFILES_ACTIVE:local}
+  datasource:
+    url: jdbc:h2:file:./local-h2-db/batchdb;DB_CLOSE_DELAY=-1
+    driver-class-name: org.h2.Driver
+    username: sa
+    password:
+  jpa:
+    hibernate.ddl-auto: update
+    show-sql: true
+EOF
+
+cat << 'EOF' > file-processing-job/src/main/resources/application.yml
+spring:
+  application.name: file-processing-job
+  profiles.active: ${SPRING_PROFILES_ACTIVE:local}
+  datasource:
+    url: jdbc:h2:file:./local-h2-db/batchdb;DB_CLOSE_DELAY=-1
+    driver-class-name: org.h2.Driver
+    username: sa
+    password:
+  jpa.hibernate.ddl-auto: update
+  batch:
+    jdbc.initialize-schema: always
+    job:
+      enabled: true
+      name: dataProcessingJob
+
+# Default fallback values for local execution testing
+FILE_ID: ${FILE_ID:test-local-id}
+FILE_NAME: ${FILE_NAME:test-local-file.csv}
+LOCAL_FILE_PATH: ${LOCAL_FILE_PATH:./local-temp-storage/test-local-file.csv}
+EOF
+
+echo "Done! Project created at '$PROJECT_DIR'."
+
