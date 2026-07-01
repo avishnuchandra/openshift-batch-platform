@@ -1,71 +1,71 @@
-graph TB
-    subgraph Client["Client Layer"]
-        A[Web UI]
-        B[API Client]
-        C[CLI]
+# Architecture Flow Diagram & Breakdown
+
+Below is the complete end-to-end flow diagram illustrating the fortified architecture. It maps out the exact sequence of events, including the resilience mechanisms (Reaper, GC, and Locking) and the hand-off between the orchestrator and the processing pod using the shared PVC.
+
+## 1. Flow Diagram (Mermaid)
+
+```mermaid
+graph TD
+    subgraph OpenShift Cluster
+        Trigger((Cron Schedule))
+        
+        subgraph Orchestrator
+            Orch[s3-import-job Pod]
+            Reaper{1. Reaper Mechanism}
+            GC{2. PVC Garbage Collection}
+            Lock{3. Pessimistic Lock Check}
+            Fabric8[4. Fabric8 API Launcher]
+        end
+        
+        subgraph Batch Processor
+            Processor[file-processing-job Pod]
+            Batch[Spring Batch Execution]
+            Cleanup[5. PVC File Cleanup]
+        end
+
+        PVC[(ReadWriteMany PVC: /mnt/moss-data)]
     end
 
-    subgraph API["API Gateway"]
-        D[REST API]
-        E[Authentication]
+    subgraph AWS
+        S3_IN[S3: input/]
+        S3_PROC[S3: in-process/]
+        S3_DONE[S3: success/ or failed/]
     end
-
-    subgraph Core["Core Services"]
-        F[Batch Scheduler]
-        G[Job Manager]
-        H[Task Executor]
-    end
-
-    subgraph Storage["Data Layer"]
-        I[(Database)]
-        J[Cache]
-        K[File Storage]
-    end
-
-    subgraph Platform["OpenShift Platform"]
-        L[Container Runtime]
-        M[Pod Manager]
-        N[Networking]
-    end
-
-    subgraph Monitoring["Observability"]
-        O[Logging]
-        P[Metrics]
-        Q[Tracing]
-    end
-
-    A --> D
-    B --> D
-    C --> D
     
-    D --> E
-    E --> F
-    
-    F --> G
-    G --> H
-    
-    H --> L
-    L --> M
-    M --> N
-    
-    F --> I
-    G --> J
-    H --> K
-    
-    H --> O
-    G --> P
-    F --> Q
+    subgraph Database
+        DB[(PostgreSQL)]
+    end
 
-    classDef client fill:#e1f5ff,stroke:#01579b,stroke-width:2px
-    classDef gateway fill:#f3e5f5,stroke:#4a148c,stroke-width:2px
-    classDef core fill:#e8f5e9,stroke:#1b5e20,stroke-width:2px
-    classDef storage fill:#fff3e0,stroke:#e65100,stroke-width:2px
-    classDef platform fill:#fce4ec,stroke:#880e4f,stroke-width:2px
-    classDef monitoring fill:#ede7f6,stroke:#311b92,stroke-width:2px
+    %% --- Orchestrator Flow ---
+    Trigger -->|Fires| Orch
+    Orch --> Reaper
+    Reaper -->|Fails records >2 hrs| DB
+    Reaper --> GC
+    GC -->|Deletes orphaned files| PVC
+    GC --> Lock
+    Lock -->|Checks for PROCESSING state| DB
+    
+    Lock -- If Locked --> Exit([Exit Gracefully])
+    Lock -- If Clear --> Fetch
+    
+    Fetch[List Oldest File] --> S3_IN
+    Fetch -->|Downloads File| PVC
+    Fetch -->|Inserts PROCESSING record| DB
+    Fetch -->|Moves File| S3_PROC
+    Fetch --> Fabric8
+    
+    %% --- Hand-off ---
+    Fabric8 -.->|Submits dynamic Job YAML| Processor
 
-    class Client client
-    class API gateway
-    class Core core
-    class Storage storage
-    class Platform platform
-    class Monitoring monitoring
+    %% --- Processor Flow ---
+    Processor --> Batch
+    Batch -->|Reads file locally| PVC
+    Batch -.->|Chunk Processing State| DB
+    
+    Batch -->|On Completion| UpdateDB[Update DB Status]
+    UpdateDB --> DB
+    UpdateDB -->|Moves File| S3_DONE
+    
+    UpdateDB --> Cleanup
+    Cleanup -->|Deletes physical file| PVC
+    Cleanup --> Terminate([Pod Terminates])
