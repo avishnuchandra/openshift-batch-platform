@@ -69,3 +69,20 @@ graph TD
     UpdateDB --> Cleanup
     Cleanup -->|Deletes physical file| PVC
     Cleanup --> Terminate([Pod Terminates])
+
+
+1. The Trigger: OpenShift triggers the `s3-import-job` based on your cron schedule (e.g., every 5 minutes).
+
+2. Cluster Safety Checks (Fortifications):
+   * Reaper: The orchestrator checks the database for any records stuck in `PROCESSING` for too long and forcefully fails them.
+   * Garbage Collection: It scans the `/mnt/moss-data` PVC directory and deletes any files left behind by a previously crashed pod.
+   * Pessimistic Lock: It checks the database to ensure no other file is currently processing. If there is, the pod dies immediately to enforce the singleton rule.
+
+3. Acquisition: The orchestrator fetches the file from S3 (`input/`), downloads it directly to the shared PVC, logs the state in the Database, and moves the S3 object to `in-process/`.
+
+4. The Hand-off: The orchestrator uses Fabric8 to dynamically spin up the `file-processing-job` Pod, passing the exact file path on the PVC as an environment variable.
+
+5. Processing & Cleanup: The new Spring Batch pod reads the file directly from the local PVC, processes it, updates the final states, and physically deletes the file from the PVC to prevent storage exhaustion before terminating.
+
+
+
