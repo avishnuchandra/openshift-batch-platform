@@ -1,0 +1,71 @@
+graph TB
+    subgraph Client["Client Layer"]
+        A[Web UI]
+        B[API Client]
+        C[CLI]
+    end
+
+    subgraph API["API Gateway"]
+        D[REST API]
+        E[Authentication]
+    end
+
+    subgraph Core["Core Services"]
+        F[Batch Scheduler]
+        G[Job Manager]
+        H[Task Executor]
+    end
+
+    subgraph Storage["Data Layer"]
+        I[(Database)]
+        J[Cache]
+        K[File Storage]
+    end
+
+    subgraph Platform["OpenShift Platform"]
+        L[Container Runtime]
+        M[Pod Manager]
+        N[Networking]
+    end
+
+    subgraph Monitoring["Observability"]
+        O[Logging]
+        P[Metrics]
+        Q[Tracing]
+    end
+
+    A --> D
+    B --> D
+    C --> D
+    
+    D --> E
+    E --> F
+    
+    F --> G
+    G --> H
+    
+    H --> L
+    L --> M
+    M --> N
+    
+    F --> I
+    G --> J
+    H --> K
+    
+    H --> O
+    G --> P
+    F --> Q
+
+    classDef client fill:#e1f5ff,stroke:#01579b,stroke-width:2px
+    classDef gateway fill:#f3e5f5,stroke:#4a148c,stroke-width:2px
+    classDef core fill:#e8f5e9,stroke:#1b5e20,stroke-width:2px
+    classDef storage fill:#fff3e0,stroke:#e65100,stroke-width:2px
+    classDef platform fill:#fce4ec,stroke:#880e4f,stroke-width:2px
+    classDef monitoring fill:#ede7f6,stroke:#311b92,stroke-width:2px
+
+    class Client client
+    class API gateway
+    class Core core
+    class Storage storage
+    class Platform platform
+    class Monitoring monitoring
